@@ -1,0 +1,95 @@
+name: Terraform Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-deployment
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: Terraform apply
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_tenancy_ocid: ${{ secrets.TF_VAR_tenancy_ocid }}
+      TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_compartment_ocid }}
+      TF_VAR_user_ocid: ${{ secrets.TF_VAR_user_ocid }}
+      TF_VAR_subnet_ocid: ${{ secrets.TF_VAR_subnet_ocid }}
+      TF_VAR_ubuntu_image_ocid: ${{ secrets.TF_VAR_ubuntu_image_ocid }}
+      TF_VAR_ssh_public_key: ${{ secrets.TF_VAR_ssh_public_key }}
+      TF_VAR_availability_domain: ${{ secrets.TF_VAR_availability_domain }}
+      TF_VAR_finger_print: ${{ secrets.TF_VAR_fingerprint }}
+      TF_VAR_private_key_path: /home/runner/.oci/oci_api_key.pem
+      TF_VAR_region: ${{ secrets.TF_VAR_region }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.6"
+
+      - name: Verificar secrets
+        env:
+          OCI_API_KEY_PEM: ${{ secrets.OCI_API_KEY_PEM }}
+        run: |
+          for name in TF_VAR_tenancy_ocid TF_VAR_compartment_ocid TF_VAR_user_ocid \
+            TF_VAR_subnet_ocid TF_VAR_ubuntu_image_ocid TF_VAR_ssh_public_key \
+            TF_VAR_availability_domain TF_VAR_finger_print TF_VAR_region; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Falta la variable $name en los secrets de GitHub."
+              exit 1
+            fi
+          done
+          if [ -z "$OCI_API_KEY_PEM" ]; then
+            echo "::error::Falta el secret OCI_API_KEY_PEM."
+            exit 1
+          fi
+
+      - name: Configurar credenciales OCI
+        env:
+          OCI_API_KEY_PEM: ${{ secrets.OCI_API_KEY_PEM }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_API_KEY_PEM" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Verificar estado de la instancia existente
+        run: |
+          if ! terraform state list | grep -Fxq 'oci_core_instance.ubuntu_vm'; then
+            echo "No se encontro la instancia en el estado de Terraform. Migra el estado local a un backend remoto antes de desplegar."
+            exit 1
+          fi
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform apply con reintentos por capacidad
+        run: |
+          set -o pipefail
+          for attempt in {1..5}; do
+            echo "Intento $attempt de 5"
+            if terraform apply -input=false -auto-approve -no-color 2>&1 | tee terraform-apply.log; then
+              exit 0
+            fi
+            if ! grep -Eqi 'Out of host capacity|OutOfHostCapacity' terraform-apply.log; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              break
+            fi
+            sleep 15
+          done
+          echo "Error: se agotaron los intentos de Terraform apply."
+          exit 1
